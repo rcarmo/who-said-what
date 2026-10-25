@@ -32,6 +32,8 @@ struct Transcript {
     let duration: Double
     let segments: [Segment]
     let names: [Int: String]
+    var languages: [LanguageRegion] = []
+    var warnings: [String] = []
 
     func name(_ speaker: Int) -> String { names[speaker] ?? "Speaker \(speaker + 1)" }
 
@@ -49,7 +51,7 @@ struct Transcript {
         let speakers = Set(segments.map(\.speaker)).sorted().map(name).joined(separator: ", ")
         let header = "\(fileName)\nDuration: \(Transcript.clock(duration))\nSpeakers: \(speakers)"
         let body = segments.map { "[\(Transcript.clock($0.start))] \(name($0.speaker)): \($0.text)" }
-        return ([header] + body).joined(separator: "\n\n") + "\n"
+        return ([header] + warnings.map { "Warning: \($0)" } + body).joined(separator: "\n\n") + "\n"
     }
 
     /// Cues of at most ~7 s / 84 characters, each prefixed with its speaker.
@@ -60,18 +62,20 @@ struct Transcript {
                 let start = Transcript.clock(words.first!.start, millis: vtt ? "." : ",")
                 let end = Transcript.clock(words.last!.end, millis: vtt ? "." : ",")
                 let line = words.map(\.text).joined().trimmingCharacters(in: .whitespaces)
-                let text = vtt ? "<v \(name(segment.speaker))>\(line)" : "\(name(segment.speaker)): \(line)"
+                let speaker = name(segment.speaker).components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+                let text = vtt ? "<v \(Transcript.vttEscape(speaker))>\(Transcript.vttEscape(line))</v>" : "\(speaker): \(line)"
                 cues.append(vtt ? "\(start) --> \(end)\n\(text)"
                                 : "\(cues.count + 1)\n\(start) --> \(end)\n\(text)")
             }
         }
-        return (vtt ? "WEBVTT\n\n" : "") + cues.joined(separator: "\n\n") + "\n"
+        let notes = warnings.map { "NOTE " + $0.replacingOccurrences(of: "\n", with: " ") }.joined(separator: "\n\n")
+        return (vtt ? "WEBVTT\n\n" + (notes.isEmpty ? "" : notes + "\n\n") : "") + cues.joined(separator: "\n\n") + "\n"
     }
 
     private var json: String {
         struct Speaker: Encodable { let id: Int; let name: String }
         struct Line: Encodable { let speaker: Int; let name: String; let start: Double; let end: Double; let text: String }
-        struct File: Encodable { let file: String; let duration: Double; let speakers: [Speaker]; let segments: [Line] }
+        struct File: Encodable { let file: String; let duration: Double; let speakers: [Speaker]; let segments: [Line]; let languages: [LanguageRegion]; let warnings: [String] }
 
         let round = { (t: Double) in (t * 100).rounded() / 100 }
         let file = File(
@@ -80,11 +84,19 @@ struct Transcript {
             speakers: Set(segments.map(\.speaker)).sorted().map { Speaker(id: $0, name: name($0)) },
             segments: segments.map {
                 Line(speaker: $0.speaker, name: name($0.speaker), start: round($0.start), end: round($0.end), text: $0.text)
-            }
+            },
+            languages: languages,
+            warnings: warnings
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         return String(decoding: (try? encoder.encode(file)) ?? Data(), as: UTF8.self) + "\n"
+    }
+
+    private static func vttEscape(_ text: String) -> String {
+        text.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
     }
 
     /// `HH:MM:SS`, or `HH:MM:SS,mmm` for subtitles.

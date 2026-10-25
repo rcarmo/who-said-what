@@ -31,6 +31,18 @@ func speed(_ audio: Double, _ took: Double) -> String {
 
 @MainActor
 final class Session: ObservableObject {
+    @Published var backend = TranscriptionBackend(rawValue: UserDefaults.standard.string(forKey: "transcriptionBackend") ?? "") ?? .voz {
+        didSet { UserDefaults.standard.set(backend.rawValue, forKey: "transcriptionBackend") }
+    }
+    @Published private(set) var activeBackend: TranscriptionBackend = .apple
+    @Published private(set) var speechStatus: String?
+    @Published var language = UserDefaults.standard.string(forKey: "primaryLanguage") ?? "auto" {
+        didSet { UserDefaults.standard.set(language, forKey: "primaryLanguage") }
+    }
+    @Published private(set) var languageSummary = ""
+    @Published private(set) var languages: [LanguageRegion] = []
+    @Published private(set) var warnings: [String] = []
+    @Published private(set) var sourceWarnings: [String] = []
     @Published var stage: Stage = .idle
     @Published var fileName = ""
     @Published var duration: Double = 0
@@ -50,6 +62,8 @@ final class Session: ObservableObject {
     @Published var totalSeconds: Double = 0
 
     private var timeObserver: Any?
+    private var job: Task<Void, Never>?
+    private var jobID = UUID()
 
     func name(_ speaker: Int) -> String { names[speaker] ?? "Speaker \(speaker + 1)" }
 
@@ -60,21 +74,36 @@ final class Session: ObservableObject {
 
     func load(_ url: URL) {
         reset()
+        let id = jobID
+        let selectedBackend = backend
+        let selectedLanguage = language
+        activeBackend = selectedBackend
         fileName = url.lastPathComponent
         stage = .preparing
-        Task {
+        job = Task {
             do {
-                let audio = try await Pipeline.playableAudio(for: url)
+                let prepared = try await Pipeline.prepareAudio(for: url)
+                let audio = prepared.url
+                defer { if audio != url { try? FileManager.default.removeItem(at: audio) } }
+                try Task.checkCancellation()
                 let dur = try await AVURLAsset(url: audio).load(.duration).seconds
+                guard dur.isFinite, dur > 0 else { throw PipelineError.emptyAudio }
+                let video = !(try await AVURLAsset(url: url).loadTracks(withMediaType: .video)).isEmpty
+                try Task.checkCancellation()
+                guard jobID == id else { return }
                 duration = dur
-                hasVideo = !(try await AVURLAsset(url: url).loadTracks(withMediaType: .video)).isEmpty
-                setUpPlayer(hasVideo ? url : audio)
+                sourceWarnings = prepared.warnings
+                hasVideo = video
+                setUpPlayer(url)
                 startedAt = Date()
                 stage = .working(diarize: 0, transcribe: 0)
 
-                async let diarization = runWho(audio)
-                async let transcription = runSpeech(audio, duration: dur)
+                async let diarization = runWho(audio, id: id)
+                async let transcription = runSpeech(audio, duration: dur, backend: selectedBackend, language: selectedLanguage, id: id)
                 let (d, w) = try await (diarization, transcription)
+                try Task.checkCancellation()
+                guard jobID == id else { return }
+                guard !w.isEmpty else { throw PipelineError.noSpeech }
                 totalSeconds = Date().timeIntervalSince(startedAt)
 
                 // Hide speakers no words were assigned to (noises Who gave a label) and renumber the rest.
@@ -86,33 +115,43 @@ final class Session: ObservableObject {
                 speakerCount = renumber.count
                 stage = .done
             } catch {
+                guard jobID == id, !Task.isCancelled else { return }
                 stage = .failed(error.localizedDescription)
             }
         }
     }
 
-    private func runWho(_ audio: URL) async throws -> Diarization {
+    private func runWho(_ audio: URL, id: UUID) async throws -> Diarization {
         let (result, took) = try await Pipeline.diarize(audio) { p in
-            Task { @MainActor in self.update(diarize: p) }
+            Task { @MainActor in if self.jobID == id { self.update(diarize: p) } }
         }
+        try Task.checkCancellation()
+        guard jobID == id else { throw CancellationError() }
         whoSeconds = took
         return result
     }
 
-    private func runSpeech(_ audio: URL, duration: Double) async throws -> [Word] {
-        let (words, took) = try await Pipeline.transcribe(audio, duration: duration) { p in
-            Task { @MainActor in self.update(transcribe: p) }
-        }
-        speechSeconds = took
-        return words
+    private func runSpeech(_ audio: URL, duration: Double, backend: TranscriptionBackend, language: String, id: UUID) async throws -> [Word] {
+        let result = try await Pipeline.transcribe(audio, duration: duration, backend: backend, language: language, status: { note in
+            Task { @MainActor in if self.jobID == id { self.speechStatus = note } }
+        }, progress: { p in
+            Task { @MainActor in if self.jobID == id { self.update(transcribe: p) } }
+        })
+        try Task.checkCancellation()
+        guard jobID == id else { throw CancellationError() }
+        speechSeconds = result.seconds
+        languageSummary = result.languageSummary
+        languages = result.languages
+        warnings = result.warnings
+        return result.words
     }
 
     private func update(diarize p: Double) {
-        if case let .working(_, t) = stage { stage = .working(diarize: p, transcribe: t) }
+        if case let .working(d, t) = stage { stage = .working(diarize: max(d, p), transcribe: t) }
     }
 
     private func update(transcribe p: Double) {
-        if case let .working(d, _) = stage { stage = .working(diarize: d, transcribe: p) }
+        if case let .working(d, t) = stage { stage = .working(diarize: d, transcribe: max(t, p)) }
     }
 
     private func setUpPlayer(_ url: URL) {
@@ -140,6 +179,9 @@ final class Session: ObservableObject {
     }
 
     func reset() {
+        job?.cancel()
+        job = nil
+        jobID = UUID()
         player?.pause()
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         player = nil
@@ -153,11 +195,18 @@ final class Session: ObservableObject {
         hasVideo = false
         whoSeconds = nil
         speechSeconds = nil
+        speechStatus = nil
+        languages = []
+        warnings = []
+        sourceWarnings = []
+        languageSummary = ""
+        duration = 0
+        totalSeconds = 0
         stage = .idle
     }
 
     var transcript: Transcript {
-        Transcript(fileName: fileName, duration: duration, segments: segments, names: names)
+        Transcript(fileName: fileName, duration: duration, segments: segments, names: names, languages: languages, warnings: sourceWarnings)
     }
 
     func rename(_ speaker: Int, to name: String) {
@@ -234,6 +283,31 @@ struct ContentView: View {
             }
             Button("Choose File…") { chooseFile() }
                 .buttonStyle(.bordered).controlSize(.large)
+            VStack(spacing: 8) {
+                Picker("Transcription", selection: $session.backend) {
+                    ForEach(TranscriptionBackend.allCases) { backend in
+                        Text(backend.title).tag(backend)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 340)
+                Picker("Primary language", selection: $session.language) {
+                    Text("Auto").tag("auto")
+                    ForEach(LanguageDetection.choices, id: \.self) { code in
+                        Text(LanguageDetection.name(code)).tag(code)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 380)
+                Text("A language hint. Changes during the recording stay enabled.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(session.backend.detail)
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 460)
+                Text("Voz can recognize language switches within a section.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
@@ -262,7 +336,7 @@ struct ContentView: View {
                             .padding(.top, -12)
                         progressRow("Who: labelling speakers",
                                     whoNote(d), d, speakerColors[0])
-                        progressRow("Transcribing speech",
+                        progressRow(session.activeBackend.title,
                                     speechNote(t, elapsed), t, speakerColors[1])
                     }
                 }
@@ -272,15 +346,17 @@ struct ContentView: View {
                 Text("Reading audio…").foregroundStyle(.white.opacity(0.5))
             }
         }
+        .safeAreaInset(edge: .bottom) { Button("Cancel") { session.reset() }.padding(20) }
     }
 
     private func whoNote(_ progress: Double) -> String? {
         if let took = session.whoSeconds { return "\(seconds(took)) · \(speed(session.duration, took)) realtime" }
-        return progress < 0.5 && !Pipeline.who.isDownloaded() ? "downloading model" : nil
+        return progress < 0.5 ? "loading bundled model" : nil
     }
 
     private func speechNote(_ progress: Double, _ elapsed: Double) -> String? {
         if let took = session.speechSeconds { return "\(seconds(took)) · \(speed(session.duration, took)) realtime" }
+        if let note = session.speechStatus { return note }
         guard progress > 0 else { return nil }
         let done = progress * session.duration
         return "\(timestamp(done)) in · \(speed(done, elapsed)) realtime"
@@ -317,6 +393,12 @@ struct ResultView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            if !session.sourceWarnings.isEmpty || !session.warnings.isEmpty {
+                Label((session.sourceWarnings + Array(session.warnings.prefix(3)) + (session.warnings.count > 3 ? ["\(session.warnings.count - 3) more language checks need review."] : [])).joined(separator: "\n"), systemImage: "exclamationmark.bubble")
+                    .font(.system(size: 12)).foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 24).padding(.bottom, 12)
+            }
             stats.padding(.horizontal, 24).padding(.bottom, 16)
             Timeline(session: session).frame(height: 54).padding(.horizontal, 24).padding(.bottom, 16)
             Divider().overlay(.white.opacity(0.08))
@@ -347,8 +429,9 @@ struct ResultView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(session.fileName).font(.system(size: 16, weight: .semibold)).foregroundStyle(.white).lineLimit(1)
-                Text("\(session.speakerCount) speakers · \(timestamp(session.duration)) of audio")
+                Text("\(session.speakerCount) speakers · \(timestamp(session.duration)) of audio · \(session.activeBackend.title)")
                     .font(.system(size: 12)).foregroundStyle(.white.opacity(0.5))
+                Text(session.languageSummary).font(.system(size: 12)).foregroundStyle(.white.opacity(0.5))
             }
             Spacer()
             HStack(spacing: 8) {
@@ -382,7 +465,7 @@ struct ResultView: View {
     private var stats: some View {
         HStack(spacing: 12) {
             statTile("Who · speaker labels", session.whoSeconds, speakerColors[0])
-            statTile("Speech to text", session.speechSeconds, speakerColors[1])
+            statTile(session.activeBackend.title, session.speechSeconds, speakerColors[1])
             statTile("Whole pipeline", session.totalSeconds, .white)
         }
     }

@@ -3,3 +3,7 @@
 .swiftpm/
 .DS_Store
 SUMMARY.md
+
+# Local recordings and generated benchmark outputs
+*.mp4
+benchmarks/

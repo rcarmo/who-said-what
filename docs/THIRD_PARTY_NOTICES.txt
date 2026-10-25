@@ -1,0 +1,21 @@
+Who Said What — third-party software and model notices
+
+Desert Ant Labs: Who, Voz, Ear, Tongue and desert-ant-core
+https://github.com/Desert-Ant-Labs/desert-ant-core
+Desert Ant Labs Source-Available License:
+https://license.desertant.com/1.0
+Models are bundled for on-device use. The SDK may send its monthly license
+check, containing no audio; it performs no runtime model downloads here.
+Voz derives from NVIDIA Parakeet TDT 0.6B v3 (CC BY 4.0).
+See the SDK/model repositories for full attribution and license terms.
+
+Additional transitive dependencies retain their respective licenses. Source
+versions are recorded in Package.resolved. Model revisions are recorded in
+Models/MODELS.txt. Bundling does not change any upstream license terms.
+
+FFmpeg 8.1.1 — FFmpeg contributors, LGPL 2.1 or later
+https://ffmpeg.org/
+Pinned source: https://github.com/FFmpeg/FFmpeg/tree/239f2c733de417201d7ad3b3b8b0d9b63285b2b1
+The standalone fallback audio decoder enables only local file protocols and
+contains no GPL/nonfree components. Its license, complete corresponding source
+archive and reproducible build script are included in Resources/Licenses.
